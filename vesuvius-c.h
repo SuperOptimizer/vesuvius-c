@@ -1215,6 +1215,13 @@ chunk *vs_sumpool(chunk *inchunk, s32 kernel, s32 stride);
 chunk* vs_unsharp_mask_3d(chunk* input, float amount, s32 kernel_size);
 chunk* vs_normalize_chunk(chunk* input);
 chunk* vs_transpose(chunk* input, const char* current_layout);
+chunk* vs_dilate(chunk* inchunk, s32 kernel);
+chunk* vs_erode(chunk* inchunk, s32 kernel);
+f32 vs_chunk_min(chunk *chunk);
+f32 vs_chunk_max(chunk *chunk);
+s32 vs_flood_fill(chunk* c, s32 z, s32 y, s32 x, chunk* visited, s32 max_size);
+chunk* vs_remove_small_components(chunk* c, s32 min_size);
+chunk* vs_threshold(chunk* inchunk, f32 threshold_value);
 
 // mesh
 mesh* vs_mesh_new(f32 *vertices, f32 *normals, s32 *indices, s32 vertex_count, s32 index_count);
@@ -2009,6 +2016,252 @@ int vs_chunk_graft(chunk* dest, chunk* src, s32 src_start[static 3], s32 dest_st
   return 0;
 }
 
+chunk* vs_remove_small_components(chunk* c, s32 min_size) {
+    s32 dims[3] = {c->dims[0], c->dims[1], c->dims[2]};
+    chunk* visited = vs_chunk_new(dims);
+    chunk* ret = vs_chunk_new(dims);
+    memcpy(ret->data, c->data, dims[0] * dims[1] * dims[2] * sizeof(float));
+
+    // Pre-calculate offsets for 6 directions (+-z, +-y, +-x)
+    s32 offsets[6] = {
+        dims[1] * dims[2],      // +z
+        -dims[1] * dims[2],     // -z
+        dims[2],                // +y
+        -dims[2],               // -y
+        1,                      // +x
+        -1                      // -x
+    };
+
+    // Stack for DFS - pre-allocate once
+    s32* stack = malloc(dims[0] * dims[1] * dims[2] * sizeof(s32));
+
+    for (s32 i = 0; i < dims[0] * dims[1] * dims[2]; i++) {
+        if (ret->data[i] > 0.0f && visited->data[i] == 0.0f) {
+            s32 stack_top = 0;
+            s32 size = 0;
+            stack[stack_top++] = i;
+
+            // First pass - count size and mark visited
+            while (stack_top > 0) {
+                s32 curr = stack[--stack_top];
+                if (visited->data[curr] > 0.0f) continue;
+
+                visited->data[curr] = 1.0f;
+                size++;
+
+                if (size >= min_size) break; // Early exit if size requirement met
+
+                // Get z,y,x from linear index
+                s32 z = curr / (dims[1] * dims[2]);
+                s32 y = (curr % (dims[1] * dims[2])) / dims[2];
+                s32 x = curr % dims[2];
+
+                // Check all 6 directions
+                for (s32 dir = 0; dir < 6; dir++) {
+                    // Check if move is valid
+                    if ((dir == 0 && z >= dims[0]-1) ||
+                        (dir == 1 && z <= 0) ||
+                        (dir == 2 && y >= dims[1]-1) ||
+                        (dir == 3 && y <= 0) ||
+                        (dir == 4 && x >= dims[2]-1) ||
+                        (dir == 5 && x <= 0)) continue;
+
+                    s32 next = curr + offsets[dir];
+                    if (ret->data[next] > 0.0f && visited->data[next] == 0.0f) {
+                        stack[stack_top++] = next;
+                    }
+                }
+            }
+
+            // If component is too small, remove it
+            if (size < min_size) {
+                for (s32 j = 0; j < dims[0] * dims[1] * dims[2]; j++) {
+                    if (visited->data[j] == 1.0f) {
+                        ret->data[j] = 0.0f;
+                    }
+                }
+            }
+
+            // Reset visited markers for found component
+            for (s32 j = 0; j < dims[0] * dims[1] * dims[2]; j++) {
+                if (visited->data[j] == 1.0f) {
+                    visited->data[j] = 2.0f;  // Mark as processed
+                }
+            }
+        }
+    }
+
+    free(stack);
+    vs_chunk_free(visited);
+    return ret;
+}
+
+s32 vs_flood_fill(chunk* c, s32 start_z, s32 start_y, s32 start_x, chunk* visited, s32 max_size) {
+    s32 dims[3] = {c->dims[0], c->dims[1], c->dims[2]};
+    s32 start_idx = start_z * dims[1] * dims[2] + start_y * dims[2] + start_x;
+
+    // Early exit checks
+    if (start_z < 0 || start_z >= dims[0] ||
+        start_y < 0 || start_y >= dims[1] ||
+        start_x < 0 || start_x >= dims[2] ||
+        c->data[start_idx] == 0.0f ||
+        visited->data[start_idx] > 0.0f) {
+        return 0;
+    }
+
+    s32 offsets[6] = {
+        dims[1] * dims[2],  // +z
+        -dims[1] * dims[2], // -z
+        dims[2],            // +y
+        -dims[2],          // -y
+        1,                 // +x
+        -1                // -x
+    };
+
+    s32* stack = malloc(dims[0] * dims[1] * dims[2] * sizeof(s32));
+    s32 stack_top = 0;
+    s32 count = 0;
+
+    stack[stack_top++] = start_idx;
+
+    while (stack_top > 0) {
+        s32 curr = stack[--stack_top];
+        if (visited->data[curr] > 0.0f) continue;
+
+        visited->data[curr] = 1.0f;
+        count++;
+
+        if (max_size > 0 && count >= max_size) {
+            free(stack);
+            return max_size;
+        }
+
+        s32 z = curr / (dims[1] * dims[2]);
+        s32 y = (curr % (dims[1] * dims[2])) / dims[2];
+        s32 x = curr % dims[2];
+
+        for (s32 dir = 0; dir < 6; dir++) {
+            if ((dir == 0 && z >= dims[0]-1) ||
+                (dir == 1 && z <= 0) ||
+                (dir == 2 && y >= dims[1]-1) ||
+                (dir == 3 && y <= 0) ||
+                (dir == 4 && x >= dims[2]-1) ||
+                (dir == 5 && x <= 0)) continue;
+
+            s32 next = curr + offsets[dir];
+            if (c->data[next] > 0.0f && visited->data[next] == 0.0f) {
+                stack[stack_top++] = next;
+            }
+        }
+    }
+
+    free(stack);
+    return count;
+}
+
+chunk* vs_erode(chunk* inchunk, s32 kernel) {
+  s32 dims[3] = {inchunk->dims[0], inchunk->dims[1], inchunk->dims[2]};
+  chunk* ret = vs_chunk_new(dims);
+
+  s32 offset = kernel / 2;
+  for (s32 z = 0; z < dims[0]; z++)
+    for (s32 y = 0; y < dims[1]; y++)
+      for (s32 x = 0; x < dims[2]; x++) {
+        f32 min_val = vs_chunk_get(inchunk, z, y, x);
+        for (s32 zi = -offset; zi <= offset; zi++)
+          for (s32 yi = -offset; yi <= offset; yi++)
+            for (s32 xi = -offset; xi <= offset; xi++) {
+              s32 nz = z + zi;
+              s32 ny = y + yi;
+              s32 nx = x + xi;
+
+              if (nz < 0 || nz >= dims[0] ||
+                  ny < 0 || ny >= dims[1] ||
+                  nx < 0 || nx >= dims[2]) {
+                continue;
+              }
+
+              f32 val = vs_chunk_get(inchunk, nz, ny, nx);
+              if (val < min_val) {
+                min_val = val;
+              }
+            }
+        vs_chunk_set(ret, z, y, x, min_val);
+      }
+  return ret;
+}
+
+chunk* vs_dilate(chunk* inchunk, s32 kernel) {
+  s32 dims[3] = {inchunk->dims[0], inchunk->dims[1], inchunk->dims[2]};
+  chunk* ret = vs_chunk_new(dims);
+
+  s32 offset = kernel / 2;
+  for (s32 z = 0; z < dims[0]; z++)
+    for (s32 y = 0; y < dims[1]; y++)
+      for (s32 x = 0; x < dims[2]; x++) {
+        f32 max_val = 0.0f;
+        for (s32 zi = -offset; zi <= offset; zi++)
+          for (s32 yi = -offset; yi <= offset; yi++)
+            for (s32 xi = -offset; xi <= offset; xi++) {
+              s32 nz = z + zi;
+              s32 ny = y + yi;
+              s32 nx = x + xi;
+
+              if (nz < 0 || nz >= dims[0] ||
+                  ny < 0 || ny >= dims[1] ||
+                  nx < 0 || nx >= dims[2]) {
+                continue;
+              }
+
+              f32 val = vs_chunk_get(inchunk, nz, ny, nx);
+              if (val > max_val) {
+                max_val = val;
+              }
+            }
+        vs_chunk_set(ret, z, y, x, max_val);
+      }
+  return ret;
+}
+
+f32 vs_chunk_max(chunk *chunk) {
+    f32 max_val = chunk->data[0];
+    s32 total = chunk->dims[0] * chunk->dims[1] * chunk->dims[2];
+
+    for (s32 i = 1; i < total; i++) {
+        if (chunk->data[i] > max_val) {
+            max_val = chunk->data[i];
+        }
+    }
+    return max_val;
+}
+
+f32 vs_chunk_min(chunk *chunk) {
+    f32 min_val = chunk->data[0];
+    s32 total = chunk->dims[0] * chunk->dims[1] * chunk->dims[2];
+
+    for (s32 i = 1; i < total; i++) {
+        if (chunk->data[i] < min_val) {
+            min_val = chunk->data[i];
+        }
+    }
+    return min_val;
+}
+
+chunk* vs_threshold(chunk* inchunk, f32 threshold_value) {
+    chunk* ret = vs_chunk_new(inchunk->dims);
+
+    for (s32 z = 0; z < ret->dims[0]; z++) {
+        for (s32 y = 0; y < ret->dims[1]; y++) {
+            for (s32 x = 0; x < ret->dims[2]; x++) {
+                f32 current_value = vs_chunk_get(inchunk, z, y, x);
+                f32 output_value = (current_value < threshold_value) ? 0.0f : current_value;
+                vs_chunk_set(ret, z, y, x, output_value);
+            }
+        }
+    }
+
+    return ret;
+}
 
 chunk* vs_maxpool(chunk* inchunk, s32 kernel, s32 stride) {
   s32 dims[3] = {
