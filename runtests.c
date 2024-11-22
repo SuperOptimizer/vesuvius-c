@@ -1,6 +1,8 @@
 #define VESUVIUS_IMPL
 #include "vesuvius-c.h"
 
+#include <unistd.h>
+
 #define TEST_CACHEDIR "./54keV_7.91um_Scroll1A.zarr/0/"
 #define TEST_ZARR_URL "https://dl.ash2txt.org/full-scrolls/Scroll1/PHercParis4.volpkg/volumes_zarr_standardized/54keV_7.91um_Scroll1A.zarr/0/"
 #define TEST_ZARRAY_URL "https://dl.ash2txt.org/full-scrolls/Scroll1/PHercParis4.volpkg/volumes_zarr_standardized/54keV_7.91um_Scroll1A.zarr/0/.zarray"
@@ -18,6 +20,39 @@ int testcurl() {
   cleanup:
   free(buf);
   printf("%s done \n",__FUNCTION__);
+  return ret;
+}
+
+int testcurl_async() {
+  printf("%s\n",__FUNCTION__);
+
+  MultiDownloadState* state = vs_download_start(TEST_ZARR_BLOCK_URL);
+  int ret = 0;
+  void* buffer;
+  long size;
+  int iters = 0;
+  while(iters < 10000) {
+    if (vs_download_poll(state, &buffer, &size)) {
+      LOG_INFO("downloaded %s for size %d",TEST_ZARR_BLOCK_URL, (s32)size);
+      // Download complete - use buffer if successful
+      if (buffer) {
+        // Use buffer
+        free(buffer);
+        break;
+      } else {
+        // ???
+        ret = 1;
+        break;
+      }
+    }
+    iters++;
+    usleep(10000); // sleep for 10 milliseconds
+  }
+  if (iters == 10000) {
+    ret = 1;
+  }
+  printf("%s done \n",__FUNCTION__);
+
   return ret;
 }
 
@@ -107,6 +142,7 @@ int testmesher() {
   printf("%s\n", __FUNCTION__);
   int ret = 0;
   float* vertices = NULL;
+  f32* colors = NULL;
   int* indices = NULL;
   volume* vol = vs_vol_new(TEST_CACHEDIR, TEST_ZARR_URL);
   chunk* mychunk;
@@ -121,10 +157,10 @@ int testmesher() {
   if (rescaled == NULL) { ret = 1; goto cleanup; }
 
   int vertex_count, indices_count;
-  ret = vs_march_cubes(rescaled->data, rescaled->dims[0], rescaled->dims[1], rescaled->dims[2], 0.5f, &vertices,
+  ret = vs_march_cubes(rescaled->data, rescaled->dims[0], rescaled->dims[1], rescaled->dims[2], 0.5f, &vertices, &colors,
                         &indices, &vertex_count, &indices_count);
   if (ret != 0) { ret = 1; goto cleanup; }
-  ret = vs_ply_write("mymesh.ply", vertices,NULL, indices, vertex_count, indices_count);
+  ret = vs_ply_write("mymesh.ply", vertices,NULL, NULL, indices, vertex_count, indices_count);
   if (ret != 0) { ret = 1; goto cleanup; }
 
   cleanup:
@@ -229,13 +265,14 @@ int testchamfer() {
   printf("%s\n", __FUNCTION__);
   float *vertices1 = NULL, *vertices2 = NULL;
   int *indices1 = NULL, *indices2 = NULL;
+  f32* colors = NULL;
   int vertex_count1, vertex_count2;
   int index_count1, index_count2;
 
   volume* vol = vs_vol_new(TEST_CACHEDIR, TEST_ZARR_URL);
   chunk* mychunk = vs_vol_get_chunk(vol, (s32[3]){2048,2048,2048},(s32[3]){128,128,128});
 
-  ret = vs_march_cubes(mychunk->data, mychunk->dims[0], mychunk->dims[1], mychunk->dims[2], 128.0f, &vertices1,
+  ret = vs_march_cubes(mychunk->data, mychunk->dims[0], mychunk->dims[1], mychunk->dims[2], 128.0f, &vertices1, &colors,
                           &indices1, &vertex_count1, &index_count1);
   if (ret != 0) { ret = 1; goto cleanup; }
 
@@ -244,7 +281,7 @@ int testchamfer() {
   if ((mychunk = vs_vol_get_chunk(vol, (s32[3]){2048+64,2048+64,2048+64},(s32[3]){64,64,64}))== NULL) {
     ret = 1; goto cleanup;
   }
-  ret = vs_march_cubes(mychunk->data, mychunk->dims[0], mychunk->dims[1], mychunk->dims[2], 128.0f, &vertices2,
+  ret = vs_march_cubes(mychunk->data, mychunk->dims[0], mychunk->dims[1], mychunk->dims[2], 128.0f, &vertices2, &colors,
                             &indices2, &vertex_count2, &index_count2);
   if (ret != 0) { ret = 1; goto cleanup; }
 
@@ -270,6 +307,7 @@ int testvol() {
   volume* vol = vs_vol_new(TEST_CACHEDIR, TEST_ZARR_URL);
 
   float *vertices = NULL;
+  float* colors = NULL;
   int *indices = NULL;
   int vertex_count;
   int index_count;
@@ -282,7 +320,7 @@ int testvol() {
       ret = 1; goto cleanup;
     }
 
-    ret = vs_march_cubes(mychunk->data, mychunk->dims[0], mychunk->dims[1], mychunk->dims[2], 128.0f, &vertices,
+    ret = vs_march_cubes(mychunk->data, mychunk->dims[0], mychunk->dims[1], mychunk->dims[2], 128.0f, &vertices,&colors,
                               &indices, &vertex_count, &index_count);
 
     if (ret != 0) {
@@ -292,7 +330,7 @@ int testvol() {
     char out_filename[1024] = {'\0'};
     sprintf(out_filename,"mymesh%d.ply",sz);
 
-    ret = vs_ply_write(out_filename, vertices,NULL, indices, vertex_count, index_count);
+    ret = vs_ply_write(out_filename, vertices,NULL, NULL,indices, vertex_count, index_count);
     if (ret != 0) {
       ret = 1; goto cleanup;
     }
@@ -309,8 +347,44 @@ int testvol() {
   return ret;
 }
 
+
+int testvol_async() {
+  printf("%s\n", __FUNCTION__);
+  int ret = 0;
+  volume* vol = vs_vol_new(TEST_CACHEDIR, TEST_ZARR_URL);
+
+  float *vertices = NULL;
+  float* colors = NULL;
+  int *indices = NULL;
+  int vertex_count;
+  int index_count;
+
+  s32 vol_start [3]= {2048,2048,2048};
+  s32 chunk_dims [3] = {256,256,256};
+
+  ChunkLoadState* state = vs_vol_get_chunk_start(vol, vol_start, chunk_dims);
+  chunk* mychunk = NULL;
+  while (!vs_vol_get_chunk_poll(state, &mychunk)) {
+    // Do other work or sleep briefly
+    usleep(10000);
+  }
+
+  ret = vs_march_cubes(mychunk->data, mychunk->dims[0], mychunk->dims[1], mychunk->dims[2], 128.0f, &vertices,&colors,
+                                &indices, &vertex_count, &index_count);
+  ret = vs_ply_write("async_downloaded.ply", vertices,NULL, NULL,indices, vertex_count, index_count);
+  slice* myslice = vs_slice_extract(mychunk,0);
+
+  cleanup:
+  vs_slice_free(myslice);
+  vs_chunk_free(mychunk);
+  vs_vol_free(vol);
+  printf("%s done \n",__FUNCTION__);
+  return ret;
+}
+
 int main(int argc, char** argv) {
   if (testcurl())      printf("testcurl failed\n");
+  if (testcurl_async())      printf("testcurl_async failed\n");
   if (testzarr())      printf("testzarr failed\n");
   if (testhistogram()) printf("testhistogram failed\n");
   if (testmesher())    printf("testmesher failed\n");
@@ -318,6 +392,7 @@ int main(int argc, char** argv) {
   if (testvcps())      printf("testvcps failed\n");
   if (testchamfer())   printf("testchamfer failed\n");
   if (testvol())       printf("testvol failed\n");
+  if (testvol_async())       printf("testvol_async failed\n");
 
 
   return 0;
