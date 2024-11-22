@@ -1310,6 +1310,10 @@ ppm* vs_ppm_read(const char* filename);
 int vs_ppm_write(const char* filename, const ppm* img, ppm_type type);
 void vs_ppm_set_pixel(ppm* img, u32 x, u32 y, u8 r, u8 g, u8 b);
 void vs_ppm_get_pixel(const ppm* img, u32 x, u32 y, u8* r, u8* g, u8* b);
+void vs_write_ppm_frame(FILE* fp, const chunk* r_chunk, const chunk* g_chunk,
+                    const chunk* b_chunk, int frame_idx);
+void vs_chunks_to_video(const chunk* r_chunk, const chunk* g_chunk, const chunk* b_chunk,
+                    const char* output_filename, int fps);
 
 //tiff
 TiffImage* vs_tiff_read(const char* filename);
