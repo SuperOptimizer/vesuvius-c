@@ -1161,6 +1161,7 @@ typedef struct zarr_metadata {
     int32_t fill_value;
     char order; // Single character 'C' or 'F'
     int32_t zarr_format;
+    char dimension_separator;
 } zarr_metadata;
 
 typedef struct rgb {
@@ -5116,7 +5117,12 @@ chunk *vs_vol_get_chunk(volume *vol, s32 vol_start[static 3], s32 chunk_dims[sta
             for (int x = xstart; x <= xend; x++) {
                 char blockpath[1024] = {'\0'};
                 chunk *c = NULL;
-                snprintf(blockpath, 1023, "%s/%d/%d/%d", vol->cache_dir, z, y, x);
+
+                if (vol->metadata.dimension_separator == '/') {
+                    snprintf(blockpath, 1023, "%s/%d/%d/%d", vol->cache_dir, z, y, x);
+                } else {
+                    snprintf(blockpath, 1023, "%s/%d.%d.%d", vol->cache_dir, z, y, x);
+                }
                 LOG_INFO("checking for zarr block at %s", blockpath);
                 if (vs__path_exists(blockpath)) {
                     LOG_INFO("reading %s from disk", blockpath);
@@ -5128,7 +5134,11 @@ chunk *vs_vol_get_chunk(volume *vol, s32 vol_start[static 3], s32 chunk_dims[sta
                     }
                 } else {
                     char url[1024] = {'\0'};
-                    snprintf(url, 1023, "%s/%d/%d/%d", vol->url, z, y, x);
+                    if (vol->metadata.dimension_separator == '/') {
+                        snprintf(url, 1023, "%s/%d/%d/%d", vol->url, z, y, x);
+                    } else {
+                        snprintf(url, 1023, "%s/%d.%d.%d", vol->url, z, y, x);
+                    }
                     LOG_INFO("downloading block from %s", url);
                     c = vs_zarr_fetch_block(url, vol->metadata);
                     if (c == NULL) {
@@ -5393,16 +5403,27 @@ int vs_zarr_parse_metadata(const char *json_string, zarr_metadata *metadata) {
         metadata->dtype[sizeof(metadata->dtype) - 1] = '\0';
     }
 
+
+
     json_object *fill_value;
     if (json_object_object_get_ex(root, "fill_value", &fill_value)) {
         metadata->fill_value = json_object_get_int(fill_value);
     }
+
 
     json_object *order_value;
     if (json_object_object_get_ex(root, "order", &order_value)) {
         const char *order_str = json_object_get_string(order_value);
         if (order_str && order_str[0]) {
             metadata->order = order_str[0];
+        }
+    }
+
+    json_object *dimension_separator;
+    if (json_object_object_get_ex(root, "dimension_separator", &dimension_separator)) {
+        const char *dimension_separator_str = json_object_get_string(dimension_separator);
+        if (dimension_separator_str && dimension_separator_str[0]) {
+            metadata->dimension_separator = dimension_separator_str[0];
         }
     }
 
@@ -5658,6 +5679,77 @@ slice* vs_slice_extract(chunk* c, int index) {
         }
     }
     return out;
+}
+
+
+// Function to write a single PPM frame from the three chunks
+void vs_write_ppm_frame(FILE* fp, const chunk* r_chunk, const chunk* g_chunk,
+                    const chunk* b_chunk, int frame_idx) {
+    int width = r_chunk->dims[2];
+    int height = r_chunk->dims[1];
+    int frame_size = width * height;
+
+    // Write PPM header
+    fprintf(fp, "P6\n%d %d\n255\n", width, height);
+
+    // Allocate buffer for one frame
+    unsigned char* frame_data = (unsigned char*)malloc(width * height * 3);
+
+    // Calculate offsets for the current frame in the chunk data
+    int frame_offset = frame_idx * frame_size;
+
+    // Combine RGB channels and convert from float [0-1] to byte [0-255]
+    for (int i = 0; i < frame_size; i++) {
+        frame_data[i * 3 + 0] = (unsigned char)(r_chunk->data[frame_offset + i] * 255.0f);
+        frame_data[i * 3 + 1] = (unsigned char)(g_chunk->data[frame_offset + i] * 255.0f);
+        frame_data[i * 3 + 2] = (unsigned char)(b_chunk->data[frame_offset + i] * 255.0f);
+    }
+
+    // Write the frame data
+    fwrite(frame_data, sizeof(unsigned char), width * height * 3, fp);
+
+    free(frame_data);
+}
+
+// Function to convert chunks to video using FFmpeg
+void vs_chunks_to_video(const chunk* r_chunk, const chunk* g_chunk, const chunk* b_chunk,
+                    const char* output_filename, int fps) {
+    char command[256];
+
+    // Verify dimensions match
+    for (int i = 0; i < 3; i++) {
+        if (r_chunk->dims[i] != g_chunk->dims[i] || r_chunk->dims[i] != b_chunk->dims[i]) {
+            fprintf(stderr, "Error: Chunk dimensions don't match\n");
+            return;
+        }
+    }
+
+    int frames = r_chunk->dims[0];
+
+    // Create temporary directory for frames
+    system("mkdir -p temp_frames");
+
+    // Write each frame as a PPM file
+    for (int f = 0; f < frames; f++) {
+        char filename[64];
+        sprintf(filename, "temp_frames/frame_%d.ppm", f);
+        FILE* fp = fopen(filename, "wb");
+        if (!fp) {
+            fprintf(stderr, "Error: Cannot create frame file %s\n", filename);
+            return;
+        }
+
+        vs_write_ppm_frame(fp, r_chunk, g_chunk, b_chunk, f);
+        fclose(fp);
+    }
+
+    // Use FFmpeg to convert PPM frames to video
+    sprintf(command, "ffmpeg -y -framerate %d -i temp_frames/frame_%%d.ppm "
+            "-c:v libx264 -pix_fmt yuv420p %s", fps, output_filename);
+    system(command);
+
+    // Clean up temporary files
+    system("rm -rf temp_frames");
 }
 
 #endif // defined(VESUVIUS_IMPL)
