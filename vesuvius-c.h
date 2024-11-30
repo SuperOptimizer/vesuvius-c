@@ -1253,8 +1253,11 @@ f32 vs_chunk_min(chunk *chunk);
 f32 vs_chunk_max(chunk *chunk);
 s32 vs_flood_fill(chunk* c, s32 z, s32 y, s32 x, chunk* visited, s32 max_size);
 chunk* vs_remove_small_components(chunk* c, s32 min_size);
-chunk* vs_threshold(chunk* inchunk, f32 threshold_value);
+chunk* vs_threshold(chunk* inchunk, f32 threshold, f32 lo, f32 hi);
 chunk* vs_histogram_equalize(chunk* inchunk, s32 num_bins);
+chunk* vs_mask(chunk* inchunk, chunk* mask);
+s32 vs_count_labels(chunk* labeled_chunk, s32** counts);
+chunk* vs_connected_components_3d(chunk* in_chunk);
 
 // mesh
 mesh* vs_mesh_new(f32 *vertices, f32 *normals, s32 *indices, u8* colors, s32 vertex_count, s32 index_count);
@@ -2346,14 +2349,14 @@ f32 vs_chunk_min(chunk *chunk) {
     return min_val;
 }
 
-chunk* vs_threshold(chunk* inchunk, f32 threshold_value) {
+chunk* vs_threshold(chunk* inchunk, f32 threshold, f32 lo, f32 hi) {
     chunk* ret = vs_chunk_new(inchunk->dims);
 
     for (s32 z = 0; z < ret->dims[0]; z++) {
         for (s32 y = 0; y < ret->dims[1]; y++) {
             for (s32 x = 0; x < ret->dims[2]; x++) {
                 f32 current_value = vs_chunk_get(inchunk, z, y, x);
-                f32 output_value = (current_value < threshold_value) ? 0.0f : current_value;
+                f32 output_value = (current_value < threshold) ? lo : hi;
                 vs_chunk_set(ret, z, y, x, output_value);
             }
         }
@@ -2665,6 +2668,171 @@ chunk* vs_histogram_equalize(chunk* inchunk, s32 num_bins) {
     free(cdf);
     vs_histogram_free(hist);
     return ret;
+}
+
+chunk* vs_mask(chunk* inchunk, chunk* mask) {
+    chunk* ret = vs_chunk_new(inchunk->dims);
+    for (int z = 0; z < inchunk->dims[0]; z++) {
+        for (int y = 0; y < inchunk->dims[1]; y++) {
+            for (int x = 0; x < inchunk->dims[2]; x++) {
+                f32 m = vs_chunk_get(mask,z,y,x);
+                f32 v = vs_chunk_get(inchunk,z,y,x);
+                vs_chunk_set(ret,z,y,x,m*v);
+            }
+        }
+    }
+    return ret;
+}
+
+#define LABEL_EPSILON 0.0001f
+#define is_labeled(val) (fabsf((val) - 1.0f) < LABEL_EPSILON)
+#define is_unlabeled(val)  (!(is_labeled(val)))
+
+
+void vs__flood_fill_2d(chunk* out_chunk, chunk* in_chunk, s32 z, s32 y, s32 x, f32 label) {
+    if (y < 0 || y >= in_chunk->dims[1] ||
+        x < 0 || x >= in_chunk->dims[2] ||
+        !is_labeled(vs_chunk_get(in_chunk, z, y, x)) ||
+        !is_unlabeled(vs_chunk_get(out_chunk, z, y, x))) {
+        return;
+    }
+
+    vs_chunk_set(out_chunk, z, y, x, label);
+
+    vs__flood_fill_2d(out_chunk, in_chunk, z, y+1, x, label);
+    vs__flood_fill_2d(out_chunk, in_chunk, z, y-1, x, label);
+    vs__flood_fill_2d(out_chunk, in_chunk, z, y, x+1, label);
+    vs__flood_fill_2d(out_chunk, in_chunk, z, y, x-1, label);
+}
+
+f32 vs__get_most_common_label(chunk* out_chunk, s32 z, s32 y, s32 x) {
+    f32 labels[9];  // Store unique labels
+    s32 counts[9];  // Store counts for each label
+    s32 num_unique = 0;
+
+    // Scan 3x3 neighborhood in previous slice
+    for (s32 dy = -1; dy <= 1; dy++) {
+        for (s32 dx = -1; dx <= 1; dx++) {
+            if (y + dy < 0 || y + dy >= out_chunk->dims[1] ||
+                x + dx < 0 || x + dx >= out_chunk->dims[2]) {
+                continue;
+            }
+
+            f32 label = vs_chunk_get(out_chunk, z-1, y+dy, x+dx);
+            if (is_unlabeled(label)) {
+                continue;
+            }
+
+            // Check if we've seen this label before
+            bool found = false;
+            for (s32 i = 0; i < num_unique; i++) {
+                if (fabsf(labels[i] - label) < LABEL_EPSILON) {
+                    counts[i]++;
+                    found = true;
+                    break;
+                }
+            }
+
+            // If new label, add it
+            if (!found && num_unique < 9) {
+                labels[num_unique] = label;
+                counts[num_unique] = 1;
+                num_unique++;
+            }
+        }
+    }
+
+    // Find label with highest count
+    if (num_unique == 0) {
+        return 0.0f;  // No labels found
+    }
+
+    s32 max_count = counts[0];
+    f32 most_common = labels[0];
+
+    for (s32 i = 1; i < num_unique; i++) {
+        if (counts[i] > max_count) {
+            max_count = counts[i];
+            most_common = labels[i];
+        }
+    }
+
+    return most_common;
+}
+chunk* vs_connected_components_3d(chunk* in_chunk) {
+    chunk* out_chunk = vs_chunk_new(in_chunk->dims);
+    f32 current_label = 0;
+
+    // Process first slice
+    for (s32 y = 0; y < in_chunk->dims[1]; y++) {
+        for (s32 x = 0; x < in_chunk->dims[2]; x++) {
+            if (is_labeled(vs_chunk_get(in_chunk, 0, y, x)) &&
+                is_unlabeled(vs_chunk_get(out_chunk, 0, y, x))) {
+                current_label += 1;
+                vs__flood_fill_2d(out_chunk, in_chunk, 0, y, x, current_label);
+                }
+        }
+    }
+
+    // Process subsequent slices
+    for (s32 z = 1; z < in_chunk->dims[0]; z++) {
+        // First pass: propagate existing labels forward
+        for (s32 y = 0; y < in_chunk->dims[1]; y++) {
+            for (s32 x = 0; x < in_chunk->dims[2]; x++) {
+                if (is_labeled(vs_chunk_get(in_chunk, z, y, x))) {
+                    f32 prev_label = vs__get_most_common_label(out_chunk, z, y, x);
+                    if (!is_unlabeled(prev_label)) {
+                        vs__flood_fill_2d(out_chunk, in_chunk, z, y, x, prev_label);
+                    }
+                }
+            }
+        }
+
+        // Second pass: create new labels for unlabeled segments
+        for (s32 y = 0; y < in_chunk->dims[1]; y++) {
+            for (s32 x = 0; x < in_chunk->dims[2]; x++) {
+                if (is_labeled(vs_chunk_get(in_chunk, z, y, x)) &&
+                    is_unlabeled(vs_chunk_get(out_chunk, z, y, x))) {
+                    current_label += 1;
+                    vs__flood_fill_2d(out_chunk, in_chunk, z, y, x, current_label);
+                    }
+            }
+        }
+    }
+
+    return out_chunk;
+}
+
+
+s32 vs_count_labels(chunk* labeled_chunk, s32** counts) {
+    // First pass: find max label
+    f32 max_label = 0;
+    for (s32 z = 0; z < labeled_chunk->dims[0]; z++) {
+        for (s32 y = 0; y < labeled_chunk->dims[1]; y++) {
+            for (s32 x = 0; x < labeled_chunk->dims[2]; x++) {
+                f32 label = vs_chunk_get(labeled_chunk, z, y, x);
+                if (label > max_label) {
+                    max_label = label;
+                }
+            }
+        }
+    }
+
+    // Allocate array for counts (+1 because we include 0)
+    s32 num_labels = (s32)max_label + 1;
+    *counts = (s32*)calloc(num_labels, sizeof(s32));
+
+    // Count voxels for each label
+    for (s32 z = 0; z < labeled_chunk->dims[0]; z++) {
+        for (s32 y = 0; y < labeled_chunk->dims[1]; y++) {
+            for (s32 x = 0; x < labeled_chunk->dims[2]; x++) {
+                f32 label = vs_chunk_get(labeled_chunk, z, y, x);
+                (*counts)[(s32)label]++;
+            }
+        }
+    }
+
+    return num_labels;
 }
 
 // mesh
@@ -5514,7 +5682,7 @@ chunk* vs_zarr_decompress_chunk(long size, void* compressed_data, zarr_metadata 
         decompressed_data = compressed_data;
         decompressed_size = size;
     } else {
-        decompressed_data = malloc(z * y * x * dtype_size);
+        decompressed_data = malloc(z * y * x * dtype_size*2);
         decompressed_size = blosc2_decompress(compressed_data, size, decompressed_data, z * y * x * dtype_size);
         if (decompressed_size < 0) {
             LOG_ERROR("Blosc2 decompression failed: %d\n", decompressed_size);
@@ -5549,13 +5717,17 @@ int vs_zarr_write_chunk(char *path, zarr_metadata metadata, chunk* c) {
         LOG_ERROR("failed to mkdirs to %s",dirname);
         return 1;
     }
-    void* compressed_buf;
+    void* compressed_buf = NULL;
     int len = vs_zarr_compress_chunk(c,metadata,&compressed_buf);
     if (len <= 0) {
         //TODO: len == 0 is probably an error, right?
         return 1;
     }
     FILE* fp = fopen(path, "wb");
+    if (fp == NULL) {
+        LOG_ERROR("failed to open %s",path);
+        return 1;
+    }
     fwrite(compressed_buf,1,len,fp);
     LOG_INFO("wrote chunk to %s",path);
     fclose(fp);
